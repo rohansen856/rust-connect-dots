@@ -1,4 +1,9 @@
 use std::io;
+use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Write};
+use std::thread;
+use std::sync::{Arc, Mutex};
+use serde::{Deserialize, Serialize};
 
 const RESET: &str = "\x1b[0m";
 const ORANGE: &str = "\x1b[93m";
@@ -9,7 +14,7 @@ const BOARD_HEIGHT: usize = 6;
 
 type Board = [[u8; BOARD_WIDTH]; BOARD_HEIGHT];
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[repr(u8)]
 enum Player {
     One = 1,
@@ -27,7 +32,7 @@ impl Player {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum MoveError {
     GameFinished,
     InvalidColumn,
@@ -44,6 +49,7 @@ impl std::fmt::Display for MoveError {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct Game {
     current_move: u8,
     current_player: Player,
@@ -199,7 +205,63 @@ impl Game {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+enum GameMessage {
+    Move(usize),
+    GameState(Game),
+    PlayerAssignment(Player),
+    Error(String),
+    Quit,
+}
+
+#[derive(Clone)]
+enum GameMode {
+    Local,
+    NetworkHost,
+    NetworkClient(String),
+}
+
 fn main() {
+    println!("🔴🟡 CONNECT 4 - Multiplayer Edition 🟡🔴");
+    println!("Choose game mode:");
+    println!("1. Local Multiplayer (same device)");
+    println!("2. Host Network Game");
+    println!("3. Join Network Game");
+    println!("Enter your choice (1-3):");
+
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice).expect("Failed to read line");
+
+    let game_mode = match choice.trim() {
+        "1" => GameMode::Local,
+        "2" => {
+            println!("Enter port to host on (default: 8080):");
+            let mut port = String::new();
+            io::stdin().read_line(&mut port).expect("Failed to read line");
+            let port = port.trim().parse().unwrap_or(8080);
+            println!("Hosting game on port {}...", port);
+            GameMode::NetworkHost
+        },
+        "3" => {
+            println!("Enter server address (e.g., 127.0.0.1:8080):");
+            let mut addr = String::new();
+            io::stdin().read_line(&mut addr).expect("Failed to read line");
+            GameMode::NetworkClient(addr.trim().to_string())
+        },
+        _ => {
+            println!("Invalid choice, defaulting to local multiplayer.");
+            GameMode::Local
+        }
+    };
+
+    match game_mode {
+        GameMode::Local => run_local_game(),
+        GameMode::NetworkHost => run_host_game(),
+        GameMode::NetworkClient(addr) => run_client_game(addr),
+    }
+}
+
+fn run_local_game() {
     let mut game = Game::default();
     game.display_board();
 
@@ -208,8 +270,8 @@ fn main() {
             println!("\n");
 
             match game.current_player {
-                Player::One => println!("PLAYER 1"),
-                Player::Two => println!("PLAYER 2"),
+                Player::One => println!("PLAYER 1 (🔴)"),
+                Player::Two => println!("PLAYER 2 (🟡)"),
                 _ => (),
             };
 
@@ -248,7 +310,6 @@ fn main() {
         println!("Press 'R' to restart or 'Q' to quit the game.");
 
         let mut user_input = String::new();
-
         io::stdin()
             .read_line(&mut user_input)
             .expect("Failed to read line");
@@ -265,4 +326,247 @@ fn main() {
             _ => game.display_error("invalid input".to_string()),
         }
     }
+}
+
+fn run_host_game() {
+    let listener = TcpListener::bind("127.0.0.1:8080").expect("Failed to bind to port");
+    println!("Waiting for a player to connect...");
+    
+    let (stream, addr) = listener.accept().expect("Failed to accept connection");
+    println!("Player connected from {}", addr);
+    
+    let game = Arc::new(Mutex::new(Game::default()));
+    let stream = Arc::new(Mutex::new(stream));
+    
+    // Send player assignment
+    {
+        let mut stream = stream.lock().unwrap();
+        let msg = GameMessage::PlayerAssignment(Player::Two);
+        let json = serde_json::to_string(&msg).unwrap();
+        writeln!(stream, "{}", json).ok();
+        stream.flush().ok();
+    }
+    
+    println!("You are Player 1 (🔴), opponent is Player 2 (🟡)");
+    
+    let game_clone = Arc::clone(&game);
+    let stream_clone = Arc::clone(&stream);
+    
+    // Spawn thread to handle incoming messages
+    thread::spawn(move || {
+        let reader = BufReader::new(stream_clone.lock().unwrap().try_clone().unwrap());
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                if let Ok(msg) = serde_json::from_str::<GameMessage>(&line) {
+                    match msg {
+                        GameMessage::Move(col) => {
+                            let mut game = game_clone.lock().unwrap();
+                            if game.current_player == Player::Two {
+                                match game.play_move(col) {
+                                    Ok(_) => {
+                                        game.display_board();
+                                    }
+                                    Err(err) => {
+                                        game.display_error(err.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        GameMessage::Quit => {
+                            println!("Opponent quit the game.");
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+    
+    // Main game loop for host
+    {
+        let game = game.lock().unwrap();
+        game.display_board();
+    }
+    
+    loop {
+        let game_finished = {
+            let game = game.lock().unwrap();
+            game.is_finished
+        };
+        
+        if game_finished {
+            break;
+        }
+        
+        let current_player = {
+            let game = game.lock().unwrap();
+            game.current_player
+        };
+        
+        if current_player == Player::One {
+            println!("\nYour turn (🔴):");
+            println!("Enter a column between 1 and 7:");
+            
+            let mut user_move = String::new();
+            io::stdin().read_line(&mut user_move).expect("Failed to read line");
+            
+            let user_move: usize = match user_move.trim().parse() {
+                Ok(num) => {
+                    if num < 1 || num > 7 {
+                        println!("Column must be between 1 and 7");
+                        continue;
+                    } else {
+                        num
+                    }
+                }
+                Err(_) => {
+                    println!("Invalid input");
+                    continue;
+                }
+            };
+            
+            {
+                let mut game = game.lock().unwrap();
+                match game.play_move(user_move - 1) {
+                    Ok(_) => {
+                        game.display_board();
+                        // Send game state to client
+                        let mut stream = stream.lock().unwrap();
+                        let msg = GameMessage::GameState((*game).clone());
+                        let json = serde_json::to_string(&msg).unwrap();
+                        writeln!(stream, "{}", json).ok();
+                        stream.flush().ok();
+                    }
+                    Err(err) => {
+                        println!("Error: {}", err);
+                    }
+                }
+            }
+        } else {
+            println!("Waiting for opponent's move...");
+            thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+    
+    println!("Game ended. Press Enter to exit.");
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+}
+
+fn run_client_game(addr: String) {
+    let stream = match TcpStream::connect(&addr) {
+        Ok(stream) => stream,
+        Err(_) => {
+            println!("Failed to connect to server at {}", addr);
+            return;
+        }
+    };
+    
+    println!("Connected to server!");
+    
+    let stream = Arc::new(Mutex::new(stream));
+    let game = Arc::new(Mutex::new(Game::default()));
+    let my_player = Arc::new(Mutex::new(Player::None));
+    
+    let stream_clone = Arc::clone(&stream);
+    let game_clone = Arc::clone(&game);
+    let player_clone = Arc::clone(&my_player);
+    
+    // Spawn thread to handle incoming messages
+    thread::spawn(move || {
+        let reader = BufReader::new(stream_clone.lock().unwrap().try_clone().unwrap());
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                if let Ok(msg) = serde_json::from_str::<GameMessage>(&line) {
+                    match msg {
+                        GameMessage::PlayerAssignment(player) => {
+                            *player_clone.lock().unwrap() = player;
+                            let player_info = match player {
+                                Player::One => "1 🔴",
+                                Player::Two => "2 🟡",
+                                _ => "Unknown"
+                            };
+                            println!("You are Player {}", player_info);
+                        }
+                        GameMessage::GameState(new_game) => {
+                            *game_clone.lock().unwrap() = new_game;
+                            game_clone.lock().unwrap().display_board();
+                        }
+                        GameMessage::Error(err) => {
+                            println!("Server error: {}", err);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+    
+    // Wait for player assignment
+    while *my_player.lock().unwrap() == Player::None {
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
+    
+    // Main game loop for client
+    loop {
+        let (current_player, game_finished) = {
+            let game = game.lock().unwrap();
+            (game.current_player, game.is_finished)
+        };
+        
+        if game_finished {
+            break;
+        }
+        
+        let my_turn = {
+            let my_player = my_player.lock().unwrap();
+            current_player == *my_player
+        };
+        
+        if my_turn {
+            let player_symbol = match *my_player.lock().unwrap() {
+                Player::One => "🔴",
+                Player::Two => "🟡",
+                _ => "?"
+            };
+            
+            println!("\nYour turn ({}):", player_symbol);
+            println!("Enter a column between 1 and 7:");
+            
+            let mut user_move = String::new();
+            io::stdin().read_line(&mut user_move).expect("Failed to read line");
+            
+            let user_move: usize = match user_move.trim().parse() {
+                Ok(num) => {
+                    if num < 1 || num > 7 {
+                        println!("Column must be between 1 and 7");
+                        continue;
+                    } else {
+                        num
+                    }
+                }
+                Err(_) => {
+                    println!("Invalid input");
+                    continue;
+                }
+            };
+            
+            // Send move to server
+            {
+                let mut stream = stream.lock().unwrap();
+                let msg = GameMessage::Move(user_move - 1);
+                let json = serde_json::to_string(&msg).unwrap();
+                writeln!(stream, "{}", json).ok();
+                stream.flush().ok();
+            }
+        } else {
+            println!("Waiting for opponent's move...");
+            thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+    
+    println!("Game ended. Press Enter to exit.");
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
 }
